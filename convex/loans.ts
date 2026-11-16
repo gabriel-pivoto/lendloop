@@ -5,6 +5,7 @@ import { displayName, isAdmin, requireAdmin, requireUser } from "./lib/access";
 import {
   canTransition,
   cleanText,
+  isIsoDate,
   isOverdue,
   rangesOverlap,
   todayUtc,
@@ -13,6 +14,20 @@ import {
   type LoanStatus,
 } from "./lib/loanRules";
 import { enqueueLoanNotification } from "./automation";
+import { loanStatus } from "./schema";
+
+const LIST_LIMIT = 200;
+const ADMIN_LIST_LIMIT = 500;
+const LOANS_PER_TOOL_LIMIT = 500;
+const ACTIVITY_LIMIT = 100;
+
+// Queries must not read the wall clock (their results are cached), so the
+// client passes its current UTC day. It only drives the "overdue" badge;
+// every rule that matters is enforced in mutations with the server clock.
+const todayArg = v.string();
+function checkToday(today: string) {
+  if (!isIsoDate(today)) throw new ConvexError("today must be YYYY-MM-DD.");
+}
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -23,7 +38,7 @@ async function loadLoanFor(
   loanId: Id<"loans">,
   me: Doc<"users">,
 ): Promise<{ loan: Doc<"loans">; actor: Actor }> {
-  const loan = await ctx.db.get(loanId);
+  const loan = await ctx.db.get("loans", loanId);
   if (!loan) throw new ConvexError("Request not found.");
   if (loan.lenderId === me._id) return { loan, actor: "lender" };
   if (loan.borrowerId === me._id) return { loan, actor: "borrower" };
@@ -50,26 +65,29 @@ export async function closeLoan(
   reason?: string,
 ) {
   const now = Date.now();
-  await ctx.db.patch(loan._id, {
+  await ctx.db.patch("loans", loan._id, {
     status: to,
     statusReason: reason,
     ...(to === "approved" || to === "declined" ? { decidedAt: now } : {}),
     ...(to === "returned" ? { returnedAt: now } : {}),
   });
-  await enqueueLoanNotification(ctx, loan._id, `loan.${to}`);
+  await enqueueLoanNotification(ctx, { ...loan, status: to, statusReason: reason }, `loan.${to}`);
 }
 
-async function hasApprovedOverlap(
-  ctx: QueryCtx,
-  toolId: Id<"tools">,
+async function loansForTool(ctx: QueryCtx, toolId: Id<"tools">) {
+  return await ctx.db
+    .query("loans")
+    .withIndex("by_toolId", (q) => q.eq("toolId", toolId))
+    .order("desc")
+    .take(LOANS_PER_TOOL_LIMIT);
+}
+
+function overlapsApproved(
+  loans: Doc<"loans">[],
   start: string,
   end: string,
   excludeId?: Id<"loans">,
 ) {
-  const loans = await ctx.db
-    .query("loans")
-    .withIndex("by_tool", (q) => q.eq("toolId", toolId))
-    .collect();
   return loans.some(
     (l) =>
       l._id !== excludeId &&
@@ -78,16 +96,14 @@ async function hasApprovedOverlap(
   );
 }
 
-type LoanView = Awaited<ReturnType<typeof toView>>;
-
 async function toView(ctx: QueryCtx, loan: Doc<"loans">, today: string) {
   const [tool, lender, borrower, events] = await Promise.all([
-    ctx.db.get(loan.toolId),
-    ctx.db.get(loan.lenderId),
-    ctx.db.get(loan.borrowerId),
+    ctx.db.get("tools", loan.toolId),
+    ctx.db.get("users", loan.lenderId),
+    ctx.db.get("users", loan.borrowerId),
     ctx.db
       .query("automationEvents")
-      .withIndex("by_loan", (q) => q.eq("loanId", loan._id))
+      .withIndex("by_loanId", (q) => q.eq("loanId", loan._id))
       .order("desc")
       .take(5),
   ]);
@@ -120,8 +136,7 @@ async function toView(ctx: QueryCtx, loan: Doc<"loans">, today: string) {
   };
 }
 
-async function views(ctx: QueryCtx, loans: Doc<"loans">[]): Promise<LoanView[]> {
-  const today = todayUtc();
+async function views(ctx: QueryCtx, loans: Doc<"loans">[], today: string) {
   return await Promise.all(loans.map((l) => toView(ctx, l, today)));
 }
 
@@ -138,41 +153,37 @@ export const request = mutation({
   },
   handler: async (ctx, { toolId, startDate, endDate, note }) => {
     const me = await requireUser(ctx);
-    const tool = await ctx.db.get(toolId);
+    const tool = await ctx.db.get("tools", toolId);
     if (!tool || tool.removedAt) throw new ConvexError("Tool not found.");
-    if (tool.ownerId === me._id)
-      throw new ConvexError("You cannot borrow your own tool.");
+    if (tool.ownerId === me._id) throw new ConvexError("You cannot borrow your own tool.");
 
     const rangeError = validateRange(startDate, endDate, todayUtc());
     if (rangeError) throw new ConvexError(rangeError);
 
-    if (await hasApprovedOverlap(ctx, toolId, startDate, endDate))
+    const toolLoans = await loansForTool(ctx, toolId);
+    if (overlapsApproved(toolLoans, startDate, endDate))
       throw new ConvexError("The tool is already booked for some of those days.");
-
-    const mine = await ctx.db
-      .query("loans")
-      .withIndex("by_borrower", (q) => q.eq("borrowerId", me._id))
-      .collect();
     if (
-      mine.some(
+      toolLoans.some(
         (l) =>
-          l.toolId === toolId &&
-          (l.status === "requested" || l.status === "approved") &&
+          l.borrowerId === me._id &&
+          l.status === "requested" &&
           rangesOverlap(startDate, endDate, l.startDate, l.endDate),
       )
     )
       throw new ConvexError("You already have a request for those dates.");
 
-    const loanId = await ctx.db.insert("loans", {
+    const loan = {
       toolId,
       lenderId: tool.ownerId,
       borrowerId: me._id,
       startDate,
       endDate,
-      status: "requested",
+      status: "requested" as const,
       note: cleanText(note, { field: "Note", max: 300 }),
-    });
-    await enqueueLoanNotification(ctx, loanId, "loan.requested");
+    };
+    const loanId = await ctx.db.insert("loans", loan);
+    await enqueueLoanNotification(ctx, { _id: loanId, ...loan }, "loan.requested");
     return loanId;
   },
 });
@@ -187,15 +198,16 @@ export const cancel = mutation({
 });
 
 export const myRequests = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { today: todayArg },
+  handler: async (ctx, { today }) => {
+    checkToday(today);
     const me = await requireUser(ctx);
     const loans = await ctx.db
       .query("loans")
-      .withIndex("by_borrower", (q) => q.eq("borrowerId", me._id))
+      .withIndex("by_borrowerId", (q) => q.eq("borrowerId", me._id))
       .order("desc")
-      .collect();
-    return await views(ctx, loans);
+      .take(LIST_LIMIT);
+    return await views(ctx, loans, today);
   },
 });
 
@@ -208,19 +220,21 @@ export const approve = mutation({
   handler: async (ctx, { loanId }) => {
     const me = await requireUser(ctx);
     const { loan, actor } = await loadLoanFor(ctx, loanId, me);
-    if (
-      await hasApprovedOverlap(ctx, loan.toolId, loan.startDate, loan.endDate, loan._id)
-    )
+    if (!canTransition(loan.status, "approved", actor))
+      throw new ConvexError(`Cannot move a ${loan.status} request to approved.`);
+    if (loan.startDate < todayUtc())
+      throw new ConvexError(
+        "This request's start date has already passed. Decline it so the borrower can ask for new dates.",
+      );
+
+    const toolLoans = await loansForTool(ctx, loan.toolId);
+    if (overlapsApproved(toolLoans, loan.startDate, loan.endDate, loan._id))
       throw new ConvexError("Another approved loan already covers those dates.");
-    await transition(ctx, loan, "approved", actor);
+    await closeLoan(ctx, loan, "approved");
 
     // Pending requests that now clash can never be approved; close them so
     // those borrowers hear back right away instead of waiting.
-    const siblings = await ctx.db
-      .query("loans")
-      .withIndex("by_tool", (q) => q.eq("toolId", loan.toolId))
-      .collect();
-    for (const other of siblings) {
+    for (const other of toolLoans) {
       if (
         other._id !== loan._id &&
         other.status === "requested" &&
@@ -237,13 +251,7 @@ export const decline = mutation({
   handler: async (ctx, { loanId, reason }) => {
     const me = await requireUser(ctx);
     const { loan, actor } = await loadLoanFor(ctx, loanId, me);
-    await transition(
-      ctx,
-      loan,
-      "declined",
-      actor,
-      cleanText(reason, { field: "Reason", max: 200 }),
-    );
+    await transition(ctx, loan, "declined", actor, cleanText(reason, { field: "Reason", max: 200 }));
   },
 });
 
@@ -257,15 +265,16 @@ export const markReturned = mutation({
 });
 
 export const incoming = query({
-  args: {},
-  handler: async (ctx) => {
+  args: { today: todayArg },
+  handler: async (ctx, { today }) => {
+    checkToday(today);
     const me = await requireUser(ctx);
     const loans = await ctx.db
       .query("loans")
-      .withIndex("by_lender", (q) => q.eq("lenderId", me._id))
+      .withIndex("by_lenderId", (q) => q.eq("lenderId", me._id))
       .order("desc")
-      .collect();
-    return await views(ctx, loans);
+      .take(LIST_LIMIT);
+    return await views(ctx, loans, today);
   },
 });
 
@@ -274,17 +283,31 @@ export const incoming = query({
 // ---------------------------------------------------------------------------
 
 export const adminAll = query({
-  args: { status: v.optional(v.string()) },
-  handler: async (ctx, { status }) => {
+  args: {
+    today: todayArg,
+    status: v.optional(v.union(loanStatus, v.literal("overdue"))),
+  },
+  handler: async (ctx, { today, status }) => {
+    checkToday(today);
     await requireAdmin(ctx);
-    const loans = await ctx.db.query("loans").order("desc").take(500);
-    const filtered =
+    // Filter through the index so older matches are not cut off by the limit.
+    const loans =
       status === "overdue"
-        ? loans.filter((l) => isOverdue(l, todayUtc()))
+        ? await ctx.db
+            .query("loans")
+            .withIndex("by_status_and_endDate", (q) =>
+              q.eq("status", "approved").lt("endDate", today),
+            )
+            .order("desc")
+            .take(ADMIN_LIST_LIMIT)
         : status
-          ? loans.filter((l) => l.status === status)
-          : loans;
-    return await views(ctx, filtered);
+          ? await ctx.db
+              .query("loans")
+              .withIndex("by_status_and_endDate", (q) => q.eq("status", status))
+              .order("desc")
+              .take(ADMIN_LIST_LIMIT)
+          : await ctx.db.query("loans").order("desc").take(ADMIN_LIST_LIMIT);
+    return await views(ctx, loans, today);
   },
 });
 
@@ -293,13 +316,13 @@ export const activity = query({
   args: { loanId: v.id("loans") },
   handler: async (ctx, { loanId }) => {
     const me = await requireUser(ctx);
-    const loan = await ctx.db.get(loanId);
+    const loan = await ctx.db.get("loans", loanId);
     if (!loan || (!isAdmin(me) && loan.lenderId !== me._id && loan.borrowerId !== me._id))
       throw new ConvexError("Request not found.");
     return await ctx.db
       .query("automationEvents")
-      .withIndex("by_loan", (q) => q.eq("loanId", loanId))
+      .withIndex("by_loanId", (q) => q.eq("loanId", loanId))
       .order("desc")
-      .collect();
+      .take(ACTIVITY_LIMIT);
   },
 });

@@ -8,7 +8,7 @@
 import { httpRouter } from "convex/server";
 import { ConvexError } from "convex/values";
 import { internal } from "./_generated/api";
-import { httpAction, type ActionCtx } from "./_generated/server";
+import { env, httpAction, type ActionCtx } from "./_generated/server";
 import { SIGNATURE_HEADER, TIMESTAMP_HEADER, verifySignature } from "./lib/hmac";
 import { isIsoDate, todayUtc } from "./lib/loanRules";
 
@@ -29,7 +29,7 @@ function signed(method: "GET" | "POST", path: string, handler: Handler) {
     if (raw.length > MAX_BODY_BYTES) return json(413, { error: "payload_too_large" });
 
     const check = await verifySignature({
-      secret: process.env.LENDLOOP_HMAC_SECRET,
+      secret: env.LENDLOOP_HMAC_SECRET,
       scope: `${method} ${path}`,
       body: raw,
       timestamp: req.headers.get(TIMESTAMP_HEADER),

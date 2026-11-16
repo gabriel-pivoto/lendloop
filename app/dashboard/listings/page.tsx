@@ -38,7 +38,9 @@ function ToolForm({
         <select className={inputClass} required value={draft.category}
           onChange={(e) => setDraft({ ...draft, category: e.target.value })}>
           <option value="" disabled>Category</option>
-          {categories.map((c) => <option key={c}>{c}</option>)}
+          {/* Explicit value: without it, browser auto-translation rewrites the
+              option text and the translated text would be submitted. */}
+          {categories.map((c) => <option key={c} value={c}>{c}</option>)}
         </select>
       </div>
       <textarea className={inputClass} rows={2} maxLength={500}

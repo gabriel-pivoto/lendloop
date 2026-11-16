@@ -3,9 +3,11 @@
 import { useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { LoanList } from "@/components/LoanCard";
+import { useTodayUtc } from "@/components/ui";
 
 export default function IncomingPage() {
-  const loans = useQuery(api.loans.incoming);
+  const today = useTodayUtc();
+  const loans = useQuery(api.loans.incoming, { today });
   const open = loans?.filter((l) => l.status === "requested" || l.status === "approved");
   const closed = loans?.filter((l) => l.status !== "requested" && l.status !== "approved");
   return (

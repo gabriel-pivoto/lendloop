@@ -24,6 +24,14 @@ export const automationStatus = v.union(
   v.literal("skipped"), // automation not configured in this environment
 );
 
+/** Loan state captured when an event is enqueued, so retries send what happened then. */
+export const loanSnapshot = v.object({
+  status: loanStatus,
+  startDate: v.string(),
+  endDate: v.string(),
+  reason: v.optional(v.string()),
+});
+
 export default defineSchema({
   // One row per Clerk user. Only what the app needs: a display name for the
   // UI and an email so n8n can notify. No phone, address or avatar is stored.
@@ -35,7 +43,7 @@ export default defineSchema({
     trustedLender: v.boolean(),
     trustedAt: v.optional(v.number()),
     trustedBy: v.optional(v.id("users")),
-  }).index("by_token", ["tokenIdentifier"]),
+  }).index("by_tokenIdentifier", ["tokenIdentifier"]),
 
   // Listings are soft deleted so loan history keeps pointing at a real row.
   tools: defineTable({
@@ -46,7 +54,7 @@ export default defineSchema({
     removedAt: v.optional(v.number()),
     removedBy: v.optional(v.id("users")),
   })
-    .index("by_owner", ["ownerId"])
+    .index("by_ownerId", ["ownerId"])
     .index("by_category", ["category"]),
 
   // A loan starts life as a request; status walks the state machine in
@@ -64,10 +72,10 @@ export default defineSchema({
     returnedAt: v.optional(v.number()),
     lastReminderAt: v.optional(v.number()),
   })
-    .index("by_tool", ["toolId"])
-    .index("by_borrower", ["borrowerId"])
-    .index("by_lender", ["lenderId"])
-    .index("by_status_end", ["status", "endDate"]),
+    .index("by_toolId", ["toolId"])
+    .index("by_borrowerId", ["borrowerId"])
+    .index("by_lenderId", ["lenderId"])
+    .index("by_status_and_endDate", ["status", "endDate"]),
 
   // Audit trail of every automation touch point, shown per loan in the UI.
   // idempotencyKey is unique by convention (enforced in automation.ts), which
@@ -79,11 +87,12 @@ export default defineSchema({
     idempotencyKey: v.string(),
     loanId: v.optional(v.id("loans")),
     event: v.optional(v.string()),
+    snapshot: v.optional(loanSnapshot),
     detail: v.optional(v.string()),
     attempts: v.number(),
     updatedAt: v.number(),
   })
-    .index("by_key", ["idempotencyKey"])
-    .index("by_loan", ["loanId"])
+    .index("by_idempotencyKey", ["idempotencyKey"])
+    .index("by_loanId", ["loanId"])
     .index("by_kind", ["kind"]),
 });

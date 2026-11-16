@@ -5,9 +5,10 @@ import { useState } from "react";
 import { api } from "@/convex/_generated/api";
 import type { Id } from "@/convex/_generated/dataModel";
 import { LoanList } from "@/components/LoanCard";
-import { Badge, Button, Card, Empty, ErrorText, Loading, useRun } from "@/components/ui";
+import { Badge, Button, Card, Empty, ErrorText, Loading, useRun, useTodayUtc } from "@/components/ui";
 
-const filters = ["", "requested", "approved", "overdue", "returned", "declined", "cancelled"];
+const filters = ["requested", "approved", "overdue", "returned", "declined", "cancelled"] as const;
+type StatusFilter = (typeof filters)[number];
 
 function Listings() {
   const tools = useQuery(api.tools.browse, {});
@@ -90,8 +91,12 @@ function Problems() {
 
 export default function AdminPage() {
   const me = useQuery(api.users.me);
-  const [status, setStatus] = useState("");
-  const loans = useQuery(api.loans.adminAll, me?.role === "admin" ? { status: status || undefined } : "skip");
+  const today = useTodayUtc();
+  const [status, setStatus] = useState<StatusFilter | "">("");
+  const loans = useQuery(
+    api.loans.adminAll,
+    me?.role === "admin" ? { today, status: status || undefined } : "skip",
+  );
 
   if (me === undefined) return <Loading />;
   if (me?.role !== "admin") return <Empty>This page is for admins.</Empty>;
@@ -102,8 +107,10 @@ export default function AdminPage() {
         <div className="flex flex-wrap items-center justify-between gap-2">
           <h1 className="text-xl font-semibold">All loans</h1>
           <select className="rounded-md border border-stone-300 bg-white px-2 py-1 text-sm"
-            value={status} onChange={(e) => setStatus(e.target.value)} aria-label="Filter loans by status">
-            {filters.map((f) => <option key={f} value={f}>{f || "All statuses"}</option>)}
+            value={status} onChange={(e) => setStatus(e.target.value as StatusFilter | "")}
+            aria-label="Filter loans by status">
+            <option value="">All statuses</option>
+            {filters.map((f) => <option key={f} value={f}>{f}</option>)}
           </select>
         </div>
         <LoanList loans={loans} perspective="admin" empty="No loans match." />

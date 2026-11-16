@@ -1,7 +1,7 @@
 /// <reference types="vite/client" />
 import { convexTest } from "convex-test";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { api } from "./_generated/api";
+import { api, internal } from "./_generated/api";
 import schema from "./schema";
 import { signPayload } from "./lib/hmac";
 import { todayUtc } from "./lib/loanRules";
@@ -48,7 +48,7 @@ describe("access control is enforced in Convex", () => {
   it("rejects anonymous callers on private queries", async () => {
     const { t } = setup();
     await expect(t.query(api.tools.browse, {})).rejects.toThrow(/sign in/);
-    await expect(t.query(api.loans.myRequests, {})).rejects.toThrow(/sign in/);
+    await expect(t.query(api.loans.myRequests, { today: todayUtc() })).rejects.toThrow(/sign in/);
   });
 
   it("exposes only name and category publicly", async () => {
@@ -93,7 +93,7 @@ describe("access control is enforced in Convex", () => {
     await alice.mutation(api.users.store, {});
     await admin.mutation(api.users.store, {});
 
-    await expect(alice.query(api.loans.adminAll, {})).rejects.toThrow(/Admins only/);
+    await expect(alice.query(api.loans.adminAll, { today: todayUtc() })).rejects.toThrow(/Admins only/);
     const toolId = await alice.mutation(api.tools.create, { name: "Saw", category: "Hand tools" });
     const [lender] = await admin.query(api.users.listLenders, {});
     await expect(
@@ -121,7 +121,7 @@ describe("loan flow", () => {
     const carolLoan = await carol.mutation(api.loans.request, { toolId, startDate: today, endDate: today });
     await alice.mutation(api.loans.approve, { loanId: bobLoan });
 
-    const [carolView] = await carol.query(api.loans.myRequests, {});
+    const [carolView] = await carol.query(api.loans.myRequests, { today: todayUtc() });
     expect(carolView._id).toBe(carolLoan);
     expect(carolView.status).toBe("declined");
 
@@ -206,5 +206,119 @@ describe("n8n HTTP endpoints", () => {
     const { t } = setup();
     const res = await signedFetch(t, "POST", "/n8n/overdue-reminders", { loanId: "x", day: "nope", status: "sent" });
     expect(res.status).toBe(400);
+  });
+});
+
+describe("review fixes", () => {
+  it("never grants admin to an unverified or unflagged email", async () => {
+    const { t } = setup();
+    for (const emailVerified of [false, undefined]) {
+      const who = t.withIdentity({
+        name: "Mallory",
+        email: "admin@example.com",
+        emailVerified,
+        subject: `mallory-${String(emailVerified)}`,
+        issuer: "test",
+      });
+      await who.mutation(api.users.store, {});
+      expect((await who.query(api.users.me, {}))?.role).toBe("user");
+      await expect(who.query(api.loans.adminAll, { today: todayUtc() })).rejects.toThrow(/Admins only/);
+    }
+  });
+
+  it("revokes admin as soon as the email leaves ADMIN_EMAILS", async () => {
+    const { as } = setup();
+    const admin = as("Ada", "admin@example.com");
+    await admin.mutation(api.users.store, {});
+    await admin.query(api.loans.adminAll, { today: todayUtc() });
+    process.env.ADMIN_EMAILS = "someone-else@example.com";
+    // No new sign-in (no users.store call) in between.
+    await expect(admin.query(api.loans.adminAll, { today: todayUtc() })).rejects.toThrow(/Admins only/);
+    expect((await admin.query(api.users.me, {}))?.role).toBe("user");
+  });
+
+  it("keeps an n8n 'failed' result instead of overwriting it with 'delivered'", async () => {
+    const { t, as } = setup();
+    const alice = as("Alice", "alice@example.com");
+    const bob = as("Bob", "bob@example.com");
+    await alice.mutation(api.users.store, {});
+    await bob.mutation(api.users.store, {});
+    const toolId = await alice.mutation(api.tools.create, { name: "Drill", category: "Power tools" });
+    await bob.mutation(api.loans.request, { toolId, startDate: todayUtc(), endDate: todayUtc() });
+    const [ev] = await t.run((ctx) => ctx.db.query("automationEvents").collect());
+
+    // n8n writes back first, then the action records its own outcome.
+    await signedFetch(t, "POST", "/n8n/notification-results", { eventId: ev._id, status: "failed" });
+    await t.mutation(internal.automation.recordDelivery, {
+      eventId: ev._id,
+      status: "delivered",
+      attempts: 1,
+    });
+    const after = await t.run((ctx) => ctx.db.get("automationEvents", ev._id));
+    expect(after?.status).toBe("failed");
+  });
+
+  it("refuses to approve a request whose start date has passed", async () => {
+    const { t, as } = setup();
+    const alice = as("Alice", "alice@example.com");
+    const bob = as("Bob", "bob@example.com");
+    await alice.mutation(api.users.store, {});
+    await bob.mutation(api.users.store, {});
+    const toolId = await alice.mutation(api.tools.create, { name: "Saw", category: "Hand tools" });
+    const loanId = await t.run(async (ctx) => {
+      const tool = (await ctx.db.get("tools", toolId))!;
+      const borrower = (await ctx.db.query("users").collect()).find((u) => u.email === "bob@example.com")!;
+      return ctx.db.insert("loans", {
+        toolId,
+        lenderId: tool.ownerId,
+        borrowerId: borrower._id,
+        startDate: "2020-01-01",
+        endDate: "2020-01-03",
+        status: "requested",
+      });
+    });
+    await expect(alice.mutation(api.loans.approve, { loanId })).rejects.toThrow(/already passed/);
+  });
+
+  it("sends the loan state from when the event happened, even after it changed", async () => {
+    const { t, as } = setup();
+    const alice = as("Alice", "alice@example.com");
+    const bob = as("Bob", "bob@example.com");
+    await alice.mutation(api.users.store, {});
+    await bob.mutation(api.users.store, {});
+    const toolId = await alice.mutation(api.tools.create, { name: "Tent", category: "Camping" });
+    const loanId = await bob.mutation(api.loans.request, { toolId, startDate: todayUtc(), endDate: todayUtc() });
+    await bob.mutation(api.loans.cancel, { loanId });
+
+    const events = await t.run((ctx) => ctx.db.query("automationEvents").collect());
+    const requested = events.find((e) => e.event === "loan.requested")!;
+    const payload = await t.query(internal.automation.notificationPayload, { eventId: requested._id });
+    expect(payload?.body.loan.status).toBe("requested");
+    expect(payload?.body.recipient).toMatchObject({ role: "lender", email: "alice@example.com" });
+    expect(JSON.stringify(payload?.body.counterpart)).not.toContain("@");
+  });
+
+  it("finds overdue loans through the index for the admin filter", async () => {
+    const { t, as } = setup();
+    const admin = as("Ada", "admin@example.com");
+    const alice = as("Alice", "alice@example.com");
+    await admin.mutation(api.users.store, {});
+    await alice.mutation(api.users.store, {});
+    const toolId = await alice.mutation(api.tools.create, { name: "Ladder", category: "Ladders" });
+    await t.run(async (ctx) => {
+      const users = await ctx.db.query("users").collect();
+      const lender = users.find((u) => u.email === "alice@example.com")!;
+      const borrower = users.find((u) => u.email === "admin@example.com")!;
+      for (const [start, end, status] of [
+        ["2020-01-01", "2020-01-02", "approved"],
+        ["2020-02-01", "2020-02-02", "returned"],
+      ] as const) {
+        await ctx.db.insert("loans", { toolId, lenderId: lender._id, borrowerId: borrower._id, startDate: start, endDate: end, status });
+      }
+    });
+    const overdue = await admin.query(api.loans.adminAll, { today: todayUtc(), status: "overdue" });
+    expect(overdue).toHaveLength(1);
+    expect(overdue[0]).toMatchObject({ status: "approved", overdue: true });
+    await expect(admin.query(api.loans.adminAll, { today: "not-a-date" })).rejects.toThrow(/YYYY-MM-DD/);
   });
 });

@@ -1,7 +1,22 @@
 "use client";
 
 import { ConvexError } from "convex/values";
-import { useCallback, useState, type ButtonHTMLAttributes, type ReactNode } from "react";
+import { useCallback, useEffect, useState, type ButtonHTMLAttributes, type ReactNode } from "react";
+
+const utcDay = () => new Date().toISOString().slice(0, 10);
+
+/**
+ * Current UTC day, refreshed every minute. Convex queries take it as an
+ * argument because they must not read the clock themselves.
+ */
+export function useTodayUtc(): string {
+  const [today, setToday] = useState(utcDay);
+  useEffect(() => {
+    const id = setInterval(() => setToday(utcDay()), 60_000);
+    return () => clearInterval(id);
+  }, []);
+  return today;
+}
 
 export function errorMessage(err: unknown): string {
   if (err instanceof ConvexError) return String(err.data);

@@ -1,7 +1,14 @@
 "use client";
 
 import { UserButton } from "@clerk/nextjs";
-import { Authenticated, AuthLoading, useConvexAuth, useMutation, useQuery } from "convex/react";
+import {
+  Authenticated,
+  AuthLoading,
+  Unauthenticated,
+  useConvexAuth,
+  useMutation,
+  useQuery,
+} from "convex/react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
@@ -76,6 +83,15 @@ export function DashboardShell({ children }: { children: ReactNode }) {
       <AuthLoading>
         <Loading />
       </AuthLoading>
+      <Unauthenticated>
+        {/* Clerk let the user in (the page guard passed) but Convex rejected
+            the token: usually a missing `aud: convex` claim or a wrong
+            CLERK_JWT_ISSUER_DOMAIN. Say so instead of rendering nothing. */}
+        <ErrorText>
+          You are signed in, but the backend could not verify your session. Try signing out and in
+          again. If it keeps happening, check the Clerk to Convex setup in the README.
+        </ErrorText>
+      </Unauthenticated>
       <Authenticated>
         <EnsureUser>
           <div className="mb-6">

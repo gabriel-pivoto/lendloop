@@ -3,9 +3,11 @@
 import { useQuery } from "convex/react";
 import { api } from "@/convex/_generated/api";
 import { LoanList } from "@/components/LoanCard";
+import { useTodayUtc } from "@/components/ui";
 
 export default function MyRequestsPage() {
-  const loans = useQuery(api.loans.myRequests);
+  const today = useTodayUtc();
+  const loans = useQuery(api.loans.myRequests, { today });
   return (
     <div className="space-y-4">
       <div>

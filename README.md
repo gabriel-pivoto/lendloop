@@ -34,6 +34,7 @@ Business rules live in [convex/lib/loanRules.ts](convex/lib/loanRules.ts):
 - No past dates.
 - Loans last at most 30 days and can be booked at most 180 days ahead.
 - Approved loans on the same tool cannot overlap.
+- A request whose start date has passed cannot be approved, only declined.
 - The state machine is closed by default:
 
 ```
@@ -199,7 +200,7 @@ The Next.js page guard ([app/dashboard/layout.tsx](app/dashboard/layout.tsx)) is
 
 **The state machine is server-side and closed.** Transitions not listed in `TRANSITIONS` are rejected, whatever the UI sends.
 
-**Admin role from configuration, not from user input.** It comes from `ADMIN_EMAILS` and requires a verified email claim, so nobody can promote themselves by signing up with an admin's address.
+**Admin role from configuration, not from user input.** It comes from `ADMIN_EMAILS` and requires an `email_verified` claim that is exactly `true`, so nobody can promote themselves by signing up with an admin's address. Every admin call checks the list again, so removing an address revokes access immediately, without waiting for a new sign-in.
 
 **Signed webhooks in both directions** ([hmac.ts](convex/lib/hmac.ts)):
 
@@ -266,7 +267,7 @@ With a local Convex backend, n8n 2.47.7 and Mailpit:
 ## Tests
 
 ```bash
-npm test          # vitest: 20 tests
+npm test          # vitest: 26 tests
 npm run typecheck
 npm run lint
 ```
@@ -277,7 +278,9 @@ npm run lint
   - The public payload has the exact expected keys.
   - Users cannot touch other users' tools or loans.
   - Admin functions are gated.
-  - Overlapping requests are auto-declined.
+  - Overlapping requests are auto-declined, and expired requests cannot be approved.
+  - Notifications carry the loan state from when the event happened, even if it is retried later.
+  - A `failed` result from n8n is never overwritten by a late `delivered`.
   - Signed HTTP endpoints reject forged calls and stay idempotent on replay.
 
 ## What I would change for production
