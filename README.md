@@ -89,7 +89,18 @@ npm install
 
 1. Create an application in the Clerk dashboard.
 2. Open **Integrations → Convex** and activate it. Copy the **Frontend API URL**; this is the JWT issuer.
-3. Put the publishable key and secret key in `.env.local`. See [.env.example](.env.example).
+3. Open **Configure → Sessions → Customize session token** and add these claims next to the managed `aud`. Without them, Convex sees no name or email, so notifications have no recipient and nobody can be admin:
+
+   ```json
+   {
+     "aud": "convex",
+     "name": "{{user.full_name}}",
+     "email": "{{user.primary_email_address}}",
+     "email_verified": "{{user.email_verified}}"
+   }
+   ```
+
+4. Put the publishable key and secret key in `.env.local`. See [.env.example](.env.example).
 
 ### 3. Convex
 
