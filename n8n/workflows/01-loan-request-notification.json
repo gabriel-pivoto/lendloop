@@ -1,0 +1,173 @@
+{
+  "id": "lendloopNotify01",
+  "name": "LendLoop · Loan request notification",
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": "lendloopErrors01",
+    "saveDataSuccessExecution": "all",
+    "saveDataErrorExecution": "all"
+  },
+  "nodes": [
+    {
+      "id": "b1e0d7e4-0001-4a10-9d1e-000000000001",
+      "name": "Loan event from Convex",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [0, 300],
+      "webhookId": "5d1c2f0e-7a4b-4c55-9e1d-lendloop0001",
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "lendloop-loan-event",
+        "responseMode": "responseNode",
+        "options": { "rawBody": true }
+      }
+    },
+    {
+      "id": "b1e0d7e4-0001-4a10-9d1e-000000000002",
+      "name": "Verify HMAC signature",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Verifies X-LendLoop-Signature over the exact bytes Convex sent.\n// Signed message: `${timestamp}.POST loan-event.${rawBody}`\nconst crypto = require('crypto');\nconst secret = $env.LENDLOOP_HMAC_SECRET;\nconst item = $input.first();\nconst headers = item.json.headers || {};\nconst timestamp = headers['x-lendloop-timestamp'];\nconst signature = headers['x-lendloop-signature'] || '';\n\nlet raw;\ntry {\n  raw = (await this.helpers.getBinaryDataBuffer(0, 'data')).toString('utf8');\n} catch (e) {\n  raw = item.binary && item.binary.data ? Buffer.from(item.binary.data.data, 'base64').toString('utf8') : null;\n}\n\nconst fail = (reason) => [{ json: { valid: false, reason } }];\nif (!secret) return fail('n8n is missing LENDLOOP_HMAC_SECRET');\nif (!raw || !timestamp || !signature) return fail('missing signature headers or body');\nif (!/^\\d{10,16}$/.test(timestamp) || Math.abs(Date.now() - Number(timestamp)) > 5 * 60 * 1000) return fail('stale or malformed timestamp');\n\nconst expected = 'sha256=' + crypto.createHmac('sha256', secret).update(`${timestamp}.POST loan-event.${raw}`).digest('hex');\nconst a = Buffer.from(expected);\nconst b = Buffer.from(signature);\nif (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return fail('bad signature');\n\nconst event = JSON.parse(raw);\n\n// Convex retries when it does not see a 2xx, so the same event can arrive\n// twice. Remember recent event ids (persists across production executions).\nconst state = $getWorkflowStaticData('global');\nstate.seen = state.seen || [];\nconst duplicate = state.seen.includes(event.eventId);\nif (!duplicate) {\n  state.seen.push(event.eventId);\n  if (state.seen.length > 500) state.seen = state.seen.slice(-500);\n}\n\nreturn [{ json: { valid: true, duplicate, event } }];"
+      }
+    },
+    {
+      "id": "b1e0d7e4-0001-4a10-9d1e-000000000003",
+      "name": "Signature valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [480, 300],
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "strict" },
+          "conditions": [
+            {
+              "id": "c0ffee00-0000-4000-8000-000000000001",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b1e0d7e4-0001-4a10-9d1e-000000000004",
+      "name": "Respond 202 Accepted",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [720, 200],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { accepted: true, duplicate: $json.duplicate } }}",
+        "options": { "responseCode": 202 }
+      }
+    },
+    {
+      "id": "b1e0d7e4-0001-4a10-9d1e-000000000005",
+      "name": "Respond 401 Unauthorized",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [720, 420],
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "{ \"error\": \"unauthorized\" }",
+        "options": { "responseCode": 401 }
+      }
+    },
+    {
+      "id": "b1e0d7e4-0001-4a10-9d1e-000000000006",
+      "name": "Compose message",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [960, 200],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const { duplicate, event } = $input.first().json;\nif (duplicate) return []; // already handled; stop quietly\n\nconst { loan, tool, recipient, counterpart } = event;\nconst dates = `${loan.startDate} to ${loan.endDate}`;\nconst copy = {\n  'loan.requested': [`${counterpart.name} wants to borrow your ${tool.name}`, `${counterpart.name} asked to borrow your ${tool.name} from ${dates}. Open LendLoop to approve or decline.`],\n  'loan.approved': [`Approved: ${tool.name}`, `${counterpart.name} approved your request for the ${tool.name} (${dates}). Coordinate pickup with them.`],\n  'loan.declined': [`Request declined: ${tool.name}`, `Your request for the ${tool.name} (${dates}) was declined.${loan.reason ? ' Reason: ' + loan.reason : ''}`],\n  'loan.cancelled': [`Request cancelled: ${tool.name}`, `${counterpart.name} cancelled their request for your ${tool.name} (${dates}).`],\n  'loan.returned': [`Returned: ${tool.name}`, `${counterpart.name} marked the ${tool.name} as returned. Thanks for borrowing responsibly!`],\n}[event.event];\n\nif (!copy) throw new Error(`Unknown event type ${event.event}`);\n\nreturn [{ json: {\n  eventId: event.eventId,\n  to: recipient.email,\n  subject: `[LendLoop] ${copy[0]}`,\n  text: `Hi ${recipient.name},\\n\\n${copy[1]}\\n\\n— LendLoop`,\n} }];"
+      }
+    },
+    {
+      "id": "b1e0d7e4-0001-4a10-9d1e-000000000007",
+      "name": "Send email",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [1200, 200],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueErrorOutput",
+      "credentials": { "smtp": { "id": "lendloopSmtp0001", "name": "LendLoop SMTP" } },
+      "parameters": {
+        "fromEmail": "={{ $env.LENDLOOP_MAIL_FROM || 'LendLoop <no-reply@lendloop.local>' }}",
+        "toEmail": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": { "appendAttribution": false }
+      }
+    },
+    {
+      "id": "b1e0d7e4-0001-4a10-9d1e-000000000008",
+      "name": "Sign write-back",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 300],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Reports the outcome back to Convex. Idempotent on eventId, so the\n// HTTP retry below is safe.\nconst crypto = require('crypto');\nconst composed = $('Compose message').first().json;\nconst failed = Boolean($json.error);\nconst body = JSON.stringify({\n  eventId: composed.eventId,\n  status: failed ? 'failed' : 'sent',\n  detail: failed ? String($json.error.message || $json.error).slice(0, 280) : 'Email sent by n8n.',\n});\nconst path = '/n8n/notification-results';\nconst ts = String(Date.now());\nconst sig = 'sha256=' + crypto.createHmac('sha256', $env.LENDLOOP_HMAC_SECRET).update(`${ts}.POST ${path}.${body}`).digest('hex');\nreturn { json: { url: $env.CONVEX_SITE_URL + path, ts, sig, body } };"
+      }
+    },
+    {
+      "id": "b1e0d7e4-0001-4a10-9d1e-000000000009",
+      "name": "Write back to Convex",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1680, 300],
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 5000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-LendLoop-Timestamp", "value": "={{ $json.ts }}" },
+            { "name": "X-LendLoop-Signature", "value": "={{ $json.sig }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}",
+        "options": { "timeout": 10000 }
+      }
+    }
+  ],
+  "connections": {
+    "Loan event from Convex": { "main": [[{ "node": "Verify HMAC signature", "type": "main", "index": 0 }]] },
+    "Verify HMAC signature": { "main": [[{ "node": "Signature valid?", "type": "main", "index": 0 }]] },
+    "Signature valid?": {
+      "main": [
+        [{ "node": "Respond 202 Accepted", "type": "main", "index": 0 }],
+        [{ "node": "Respond 401 Unauthorized", "type": "main", "index": 0 }]
+      ]
+    },
+    "Respond 202 Accepted": { "main": [[{ "node": "Compose message", "type": "main", "index": 0 }]] },
+    "Compose message": { "main": [[{ "node": "Send email", "type": "main", "index": 0 }]] },
+    "Send email": {
+      "main": [
+        [{ "node": "Sign write-back", "type": "main", "index": 0 }],
+        [{ "node": "Sign write-back", "type": "main", "index": 0 }]
+      ]
+    },
+    "Sign write-back": { "main": [[{ "node": "Write back to Convex", "type": "main", "index": 0 }]] }
+  },
+  "pinData": {},
+  "meta": { "templateCredsSetupCompleted": true }
+}

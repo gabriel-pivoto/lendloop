@@ -1,0 +1,59 @@
+{
+  "id": "lendloopErrors01",
+  "name": "LendLoop · Error handler",
+  "active": false,
+  "settings": { "executionOrder": "v1", "saveDataErrorExecution": "all" },
+  "nodes": [
+    {
+      "id": "d3a2f9a6-0003-4c30-9f3a-000000000001",
+      "name": "On workflow error",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [0, 300],
+      "parameters": {}
+    },
+    {
+      "id": "d3a2f9a6-0003-4c30-9f3a-000000000002",
+      "name": "Sign error report",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 300],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// Forwards any failed LendLoop execution to Convex so admins see it in the\n// app (Admin > Automation problems) instead of only inside n8n.\n// Only metadata is sent: no input data from the failed run.\nconst crypto = require('crypto');\nconst { execution = {}, workflow = {}, trigger } = $input.first().json;\nconst err = execution.error || (trigger && trigger.error) || {};\nconst body = JSON.stringify({\n  executionId: String(execution.id || `trigger-${workflow.id}-${Date.now()}`),\n  workflowName: String(workflow.name || 'unknown workflow'),\n  nodeName: execution.lastNodeExecuted ? String(execution.lastNodeExecuted) : undefined,\n  message: String(err.message || 'Unknown error').slice(0, 1000),\n});\nconst path = '/n8n/workflow-errors';\nconst ts = String(Date.now());\nconst sig = 'sha256=' + crypto.createHmac('sha256', $env.LENDLOOP_HMAC_SECRET).update(`${ts}.POST ${path}.${body}`).digest('hex');\nreturn [{ json: { url: $env.CONVEX_SITE_URL + path, ts, sig, body } }];"
+      }
+    },
+    {
+      "id": "d3a2f9a6-0003-4c30-9f3a-000000000003",
+      "name": "Report to Convex",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 300],
+      "retryOnFail": true,
+      "maxTries": 5,
+      "waitBetweenTries": 5000,
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            { "name": "X-LendLoop-Timestamp", "value": "={{ $json.ts }}" },
+            { "name": "X-LendLoop-Signature", "value": "={{ $json.sig }}" }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ $json.body }}",
+        "options": { "timeout": 10000 }
+      }
+    }
+  ],
+  "connections": {
+    "On workflow error": { "main": [[{ "node": "Sign error report", "type": "main", "index": 0 }]] },
+    "Sign error report": { "main": [[{ "node": "Report to Convex", "type": "main", "index": 0 }]] }
+  },
+  "pinData": {},
+  "meta": { "templateCredsSetupCompleted": true }
+}
